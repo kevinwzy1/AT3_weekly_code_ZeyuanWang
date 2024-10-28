@@ -1,0 +1,122 @@
+from collections import defaultdict
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from sklearn.model_selection import train_test_split
+from datasets import load_dataset
+
+# Load the dataset
+dataset = load_dataset("eriktks/conll2003", trust_remote_code=True)
+
+# Extract sentences and labels from the dataset
+train_sentences = [example['tokens'] for example in dataset['train']]
+train_labels = [example['ner_tags'] for example in dataset['train']]
+label_list = dataset['train'].features['ner_tags'].feature.names  
+
+MAX_LEN = 128 
+word2idx = defaultdict(lambda: 1)  
+word2idx["PAD"] = 0
+for sentence in train_sentences:
+    for word in sentence:
+        if word not in word2idx:
+            word2idx[word] = len(word2idx)
+
+# Convert words to indices and pad sequences
+X = [[word2idx[word] for word in sentence] for sentence in train_sentences]
+X = pad_sequences(X, maxlen=MAX_LEN, padding='post')
+
+# Label padding
+PAD_LABEL = len(label_list)  
+Y = pad_sequences(train_labels, maxlen=MAX_LEN, padding='post', value=PAD_LABEL)
+
+# Train/test split
+X_train, X_val, Y_train, Y_val = train_test_split(X, Y, test_size=0.1)
+
+# Optionally create sample weights to ignore padding and 'O' labels during training
+sample_weights = []
+for labels in Y_train:
+    weights = [0.0 if label == 0 or label == PAD_LABEL else 1.0 for label in labels]  
+    sample_weights.append(weights)
+
+print(f"Training size: {len(X_train)}, Validation size: {len(X_val)}")
+
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Embedding, Bidirectional, LSTM, Dense
+from tensorflow.keras.models import Model
+from tensorflow_addons.text.crf import crf_log_likelihood, crf_decode
+
+# Define the crf_loss function outside
+def crf_loss(y_true, y_pred, transition_params):
+    mask = tf.cast(tf.not_equal(y_true, PAD_LABEL), dtype=tf.float32)  
+    sequence_lengths = tf.reduce_sum(mask, axis=-1)
+    log_likelihood, _ = crf_log_likelihood(y_pred, y_true, sequence_lengths, transition_params)
+    return -tf.reduce_mean(log_likelihood)
+
+# Define the BiLSTM-CRF model
+def build_bilstm_crf_model(max_len, n_words, n_tags):
+    input = Input(shape=(max_len,))
+    model = Embedding(input_dim=n_words, output_dim=128, input_length=max_len)(input)
+    model = Bidirectional(LSTM(units=64, return_sequences=True))(model)
+    logits = Dense(n_tags)(model)  # Ensure n_tags includes padding and 'O'
+    transition_params = tf.Variable(tf.random.uniform(shape=(n_tags, n_tags)))
+    return Model(input, logits), transition_params
+
+PAD_LABEL = len(label_list)
+n_tags = len(label_list) + 1 
+model, transition_params = build_bilstm_crf_model(MAX_LEN, len(word2idx), n_tags)
+model.compile(optimizer='adam', loss=lambda y_true, y_pred: crf_loss(y_true, y_pred, transition_params))
+history = model.fit(X_train, Y_train, batch_size=32, epochs=5, validation_data=(X_val, Y_val))
+
+import numpy as np
+y_pred_logits = model.predict(X_val)
+y_pred = np.argmax(y_pred_logits, axis=-1)
+
+# Flatten true and predicted labels for comparison
+true_labels_flat = [label for sequence in Y_val for label in sequence]
+predicted_labels_flat = [label for sequence in y_pred for label in sequence]
+
+mask = np.array(true_labels_flat) != 0  
+true_labels_filtered = np.array(true_labels_flat)[mask]
+predicted_labels_filtered = np.array(predicted_labels_flat)[mask]
+
+# Generate classification report 
+from sklearn.metrics import classification_report
+filtered_labels = [i for i, label in enumerate(label_list) if label != 'O']
+
+report = classification_report(
+    true_labels_filtered, 
+    predicted_labels_filtered, 
+    labels=filtered_labels,  # Exclude '0' (O) label
+    target_names=[label for label in label_list if label != 'O']
+)
+print(report)
+
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+conf_matrix = confusion_matrix(true_labels_filtered, predicted_labels_filtered)
+
+conf_matrix_without_last_row_col = conf_matrix[:-1, :-1]
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(conf_matrix_without_last_row_col, annot=True, fmt="d", cmap="Blues", xticklabels=filtered_labels[:-1], yticklabels=filtered_labels[:-1])
+plt.title("Confusion Matrix for NER ")
+plt.xlabel("Predicted Labels")
+plt.ylabel("True Labels")
+plt.show()
+
+# Sample sentence to test
+test_sentence = ["John", "lives", "in", "New", "York", "City", "."]
+
+# Convert words to indices using the same word2idx used during training
+X_test = [[word2idx.get(word, 1) for word in test_sentence]]  # 1 is for unknown words
+X_test_padded = pad_sequences(X_test, maxlen=MAX_LEN, padding='post')
+
+# Get model predictions
+y_pred_logits = model.predict(X_test_padded)
+y_pred = np.argmax(y_pred_logits, axis=-1)
+
+# Decode the predicted labels back to their names
+predicted_labels = [label_list[label] for label in y_pred[0] if label != PAD_LABEL]
+
+# Output the result
+for word, label in zip(test_sentence, predicted_labels):
+    print(f"{word}: {label}")
